@@ -1,14 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Teaching template: pure 3D U-Net baseline (no Mamba blocks) for multi-class 3D segmentation.
+Pure 3D U-Net baseline (no Mamba blocks) for multi-class 3D segmentation.
 
-This file is intentionally parallel to `mamba3d_unet_template.py`:
-- Same dataset layout
-- Same preprocessing + patch tiling + Gaussian merge (validation: `VAL_STEP`; test: `INFER_STEP`)
-- Same training loss (weighted Dice + weighted CE)
-- Same evaluation (**unweighted** Dice reporting)
-
-Only the model architecture differs (conv-only 3D U-Net baseline).
+Same dataset layout, patch tiling, losses, and merged-volume eval as mamba3d_unet_template.py.
 """
 
 from __future__ import annotations
@@ -48,13 +42,16 @@ PATCH_D = 8
 PATCH_H = HEIGHT // 4
 PATCH_W = WIDTH // 4
 
-VAL_STEP = (PATCH_H // 2, PATCH_W // 2, PATCH_D)  # val merge: 50% H/W, full-depth stride along D
-INFER_STEP = (PATCH_H // 2, PATCH_W // 2, PATCH_D // 2)  # test: 50% overlap H, W, D
-TRAIN_STEP = (PATCH_H, PATCH_W, PATCH_D // 2)
+VAL_STEP = (PATCH_H // 2, PATCH_W // 2, PATCH_D)  # (64, 64, 8)
+INFER_STEP = (PATCH_H // 2, PATCH_W // 2, PATCH_D // 2)  # (64, 64, 4)
+TRAIN_STEP = (PATCH_H, PATCH_W, PATCH_D // 2)  # (128, 128, 4)
 
-EPOCHS = 200
-PATIENCE = 20
-MAX_PATIENTS: Optional[int] = None
+EPOCHS = int(os.environ.get("EPOCHS", "5000"))
+PATIENCE = int(os.environ.get("PATIENCE", "20"))
+_max_pat = os.environ.get("MAX_PATIENTS", "135")
+MAX_PATIENTS: Optional[int] = None if _max_pat.lower() in ("", "none", "all") else int(_max_pat)
+
+BASE_CHANNELS = int(os.environ.get("BASE_CHANNELS", "16"))
 
 AUG_PROB = 0.5
 FOREGROUND_THRESHOLD = 0.0
@@ -67,11 +64,11 @@ WEIGHT_DECAY = 1e-5
 
 CLASS_NAMES: Dict[int, str] = {
     0: "background",
-    1: "class_1",
-    2: "class_2",
-    3: "class_3",
-    4: "class_4",
-    5: "class_5",
+    1: "EDH",
+    2: "ICH",
+    3: "IVH",
+    4: "SAH",
+    5: "SDH",
 }
 
 CT_WINDOWS = [
@@ -81,7 +78,17 @@ CT_WINDOWS = [
     [60, 120],
 ]
 
-CLASS_WEIGHT_VALUES = [1.0] + [4.0] * (len(CLASS_NAMES) - 1)
+_STARTING_CLASS_WEIGHTS = [0.171, 198.741, 15.075, 52.645, 58.868, 28.757]
+
+
+def dampened_class_weights(starting: List[float]) -> List[float]:
+    min_w = min(starting)
+    normalized = [w / min_w for w in starting]
+    dampened = [math.sqrt(w) for w in normalized]
+    return [round(w, 3) for w in dampened]
+
+
+CLASS_WEIGHT_VALUES = dampened_class_weights(_STARTING_CLASS_WEIGHTS)
 
 
 # =============================================================================
@@ -106,7 +113,7 @@ def normalize_image01(image: np.ndarray) -> np.ndarray:
     mn = float(np.min(image))
     mx = float(np.max(image))
     if mx - mn <= 0:
-        return np.zeros_like(image, dtype=np.float32)
+        return image.astype(np.float32, copy=False)
     return ((image - mn) / (mx - mn)).astype(np.float32, copy=False)
 
 
@@ -126,7 +133,11 @@ def pad_depth_axis_background(img: np.ndarray, mask_oh: np.ndarray, pad_amount: 
     return np.concatenate([img, img_tail], axis=2), np.concatenate([mask_oh, mask_tail], axis=2)
 
 
-def zoom_2d(img: np.ndarray, mask: np.ndarray, zoom_factor: float) -> Tuple[np.ndarray, np.ndarray]:
+def zoom(img: np.ndarray, mask: np.ndarray, p: float = AUG_PROB) -> Tuple[np.ndarray, np.ndarray]:
+    if random.random() > p:
+        return img, mask
+
+    zoom_factor = random.uniform(0.7, 1.3)
     h, w = img.shape[0], img.shape[1]
     new_h = max(1, int(round(h * zoom_factor)))
     new_w = max(1, int(round(w * zoom_factor)))
@@ -141,49 +152,51 @@ def zoom_2d(img: np.ndarray, mask: np.ndarray, zoom_factor: float) -> Tuple[np.n
         axis=-1,
     )
 
-    def _fit_spatial(vol: np.ndarray) -> np.ndarray:
+    def _fit_spatial(vol: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
         out = np.asarray(vol)
         hh, ww = out.shape[0], out.shape[1]
-        if hh > h:
-            top = (hh - h) // 2
-            out = out[top : top + h, :, :, :]
-        if ww > w:
-            left = (ww - w) // 2
-            out = out[:, left : left + w, :, :]
+        if hh > target_h:
+            top = (hh - target_h) // 2
+            out = out[top : top + target_h, :, :, :]
+            hh = target_h
+        if ww > target_w:
+            left = (ww - target_w) // 2
+            out = out[:, left : left + target_w, :, :]
+            ww = target_w
         hh, ww = out.shape[0], out.shape[1]
-        if hh < h or ww < w:
-            pad_top = (h - hh) // 2
-            pad_bottom = h - hh - pad_top
-            pad_left = (w - ww) // 2
-            pad_right = w - ww - pad_left
+        if hh < target_h or ww < target_w:
+            pad_top = (target_h - hh) // 2
+            pad_bottom = target_h - hh - pad_top
+            pad_left = (target_w - ww) // 2
+            pad_right = target_w - ww - pad_left
             try:
                 out = np.pad(out, ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0), (0, 0)), mode="reflect")
             except ValueError:
                 out = np.pad(out, ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0), (0, 0)), mode="edge")
         return out
 
-    return _fit_spatial(img_scaled).astype(np.float32, copy=False), _fit_spatial(mask_scaled).astype(np.float32, copy=False)
+    return _fit_spatial(img_scaled, h, w), _fit_spatial(mask_scaled, h, w)
 
 
-def mirroring(img: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    if random.random() < 0.5:
+def mirroring(img: np.ndarray, mask: np.ndarray, p: float = AUG_PROB) -> Tuple[np.ndarray, np.ndarray]:
+    if random.random() > p:
         img = np.flip(img, axis=0)
         mask = np.flip(mask, axis=0)
-    if random.random() < 0.5:
+    if random.random() > p:
         img = np.flip(img, axis=1)
         mask = np.flip(mask, axis=1)
     return img, mask
 
 
-def random_rotate_90(img: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    k = random.choice([0, 1, 2, 3])
-    if k == 0:
+def random_rotate(img: np.ndarray, mask: np.ndarray, p: float = AUG_PROB) -> Tuple[np.ndarray, np.ndarray]:
+    if random.random() > p:
         return img, mask
+    k = random.choice([1, 2, 3])
     img_out = np.empty_like(img)
     mask_out = np.empty_like(mask)
-    for zz in range(img.shape[2]):
-        img_out[:, :, zz, :] = np.rot90(img[:, :, zz, :], k=k, axes=(0, 1))
-        mask_out[:, :, zz, :] = np.rot90(mask[:, :, zz, :], k=k, axes=(0, 1))
+    for d in range(img.shape[2]):
+        img_out[:, :, d, :] = np.rot90(img[:, :, d, :], k=k, axes=(0, 1))
+        mask_out[:, :, d, :] = np.rot90(mask[:, :, d, :], k=k, axes=(0, 1))
     return img_out, mask_out
 
 
@@ -233,24 +246,27 @@ class PatchGenerator:
         if self.shuffle:
             np.random.shuffle(self.indices)
 
-    def _load_and_preprocess(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
+    def _load_raw(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
         img = nib.load(self.image_files[idx], mmap=True).get_fdata(dtype=np.float32)
         img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
-        mask = nib.load(self.mask_files[idx], mmap=True).get_fdata().astype(np.int64, copy=False)
+        mask = nib.load(self.mask_files[idx], mmap=True).get_fdata().astype(np.uint8, copy=False)
+        return img, mask
 
+    def _preprocess(self, img: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         img = normalize_image01(standardize_windows(img, self.windows))
         mask_oh = one_hot_np(mask, self.num_classes).astype(np.float32, copy=False)
 
+        if self.augment and random.random() > AUG_PROB:
+            img, mask_oh = zoom(img, mask_oh, p=AUG_PROB)
+            img, mask_oh = mirroring(img, mask_oh, p=AUG_PROB)
+            img, mask_oh = random_rotate(img, mask_oh, p=AUG_PROB)
+
         img = resize(img, (HEIGHT, WIDTH, img.shape[2], img.shape[3]), order=1, preserve_range=True, anti_aliasing=True).astype(np.float32, copy=False)
         mask_oh = resize(mask_oh, (HEIGHT, WIDTH, mask_oh.shape[2], self.num_classes), order=0, preserve_range=True, anti_aliasing=False).astype(np.float32, copy=False)
-
-        if self.augment and random.random() < AUG_PROB:
-            zf = random.uniform(0.7, 1.3)
-            img, mask_oh = zoom_2d(img, mask_oh, zf)
-            img, mask_oh = mirroring(img, mask_oh)
-            img, mask_oh = random_rotate_90(img, mask_oh)
-
         return img, mask_oh
+
+    def _load_and_preprocess(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        return self._preprocess(*self._load_raw(idx))
 
     def _patchify_all(self, img: np.ndarray, mask_oh: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int, int]]:
         ph, pw, pd, cin = self.patch_size
@@ -269,14 +285,28 @@ class PatchGenerator:
 
     def get_train_patches(self, patient_i: int) -> VolumeBatch:
         idx = int(self.indices[patient_i])
-        img, mask_oh = self._load_and_preprocess(idx)
-        if float(mask_oh[..., 1:].sum()) <= 0.0:
-            return VolumeBatch(patches_img=np.empty((0,) + self.patch_size, np.float32), patches_mask=np.empty((0, self.patch_size[0], self.patch_size[1], self.patch_size[2], self.num_classes), np.float32))
+        img_raw, mask_raw = self._load_raw(idx)
+        empty = VolumeBatch(
+            patches_img=np.empty((0,) + self.patch_size, np.float32),
+            patches_mask=np.empty(
+                (0, self.patch_size[0], self.patch_size[1], self.patch_size[2], self.num_classes),
+                np.float32,
+            ),
+        )
 
-        patches_img, patches_mask, _grid = self._patchify_all(img, mask_oh)
-        fg_vox = patches_mask[..., 1:].sum(axis=(1, 2, 3, 4))
-        keep = (fg_vox / max(1.0, float(self.patch_voxels))) > self.threshold
-        return VolumeBatch(patches_img=patches_img[keep], patches_mask=patches_mask[keep])
+        for _ in range(100):
+            img, mask_oh = self._preprocess(img_raw, mask_raw)
+            if float(mask_oh[..., 1:].sum()) <= 0.0:
+                continue
+
+            patches_img, patches_mask, _grid = self._patchify_all(img, mask_oh)
+            fg_vox = patches_mask[..., 1:].sum(axis=(1, 2, 3, 4))
+            keep = (fg_vox / max(1.0, float(self.patch_voxels))) > self.threshold
+            if np.any(keep):
+                return VolumeBatch(patches_img=patches_img[keep], patches_mask=patches_mask[keep])
+            return empty
+
+        raise RuntimeError("Unable to generate a non-empty patch batch after multiple retries.")
 
     def get_volume_for_merge(self, patient_i: int) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[int, int, int]]]:
         img, mask_oh = self._load_and_preprocess(int(patient_i))
@@ -517,7 +547,7 @@ class _ConvBlock3d(nn.Module):
 
 
 class UNet3D(nn.Module):
-    """Baseline 3D U-Net (no Mamba). Input (N,C,D,H,W) → logits (N,num_classes,D,H,W)."""
+    """Baseline 3D U-Net (no Mamba)."""
 
     def __init__(self, in_channels: int, num_classes: int, base_channels: int = 16, dropout: float = 0.1):
         super().__init__()
@@ -712,11 +742,10 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
 
-    _base = 16
-    model = UNet3D(in_channels=cin, num_classes=num_classes, base_channels=_base, dropout=0.1).to(device)
-    print(f"Model on {device} (base_channels={_base}, architecture=UNet3D baseline)")
-
+    model = UNet3D(in_channels=cin, num_classes=num_classes, base_channels=BASE_CHANNELS, dropout=0.1).to(device)
+    print(f"Model on {device} (base_channels={BASE_CHANNELS}, architecture=UNet3D baseline)")
     class_weights = torch.tensor(CLASS_WEIGHT_VALUES, dtype=torch.float32, device=device)
+    print(f"Dampened weights: {CLASS_WEIGHT_VALUES}")
     optimizer = optim.AdamW(model.parameters(), lr=INITIAL_LR, weight_decay=WEIGHT_DECAY)
     scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
 

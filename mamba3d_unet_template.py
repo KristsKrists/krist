@@ -1,32 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Teaching template: 3D Tri-Oriented Mamba U-Net for multi-class 3D segmentation.
+3D Tri-Oriented Mamba U-Net for multi-class 3D segmentation.
 
-This script is intended to be uploaded to GitHub as a public, re-trainable template.
-It contains no personal file paths and no test-time augmentation (TTA).
+Dataset layout under DATASET_ROOT:
+  train_images/ train_masks/  val_images/ val_masks/  test_images/ test_masks/
 
-## Dataset layout
-
-DATASET_ROOT/
-  train_images/   train_masks/
-  val_images/     val_masks/
-  test_images/    test_masks/
-
-Images/masks are expected to be NIfTI `.nii` volumes.
-
-## Shapes
-
-- NumPy volumes/patches: (H, W, D, C)
-- PyTorch tensors:       (N, C, D, H, W)
-
-## Evaluation
-
-Merged-volume metrics stitch patch softmax predictions with a Gaussian blend.
-**Validation** uses `VAL_STEP` (50% overlap on H/W; depth stride equals patch depth, so no overlap along D).
-**Test** uses `INFER_STEP` (50% overlap on H, W, and D). This split matches the reference bachelor Colab setup.
-
-The reported test Dice metrics are **unweighted** (macro-average across foreground classes).
-Training losses can remain class-weighted (weighted Dice + weighted CE) to handle imbalance.
+NumPy volumes/patches: (H, W, D, C).  PyTorch tensors: (N, C, D, H, W).
 """
 
 from __future__ import annotations
@@ -82,9 +61,14 @@ INFER_STEP = (PATCH_H // 2, PATCH_W // 2, PATCH_D // 2)  # e.g. (64, 64, 4)
 TRAIN_STEP = (PATCH_H, PATCH_W, PATCH_D // 2)  # (128, 128, 4)
 
 BATCH_SIZE_PATIENTS = 1  # one patient at a time; patches are iterated inside the loop
-EPOCHS = 200
-PATIENCE = 20
-MAX_PATIENTS: Optional[int] = None  # e.g. 20 for quick demo; None = all
+
+EPOCHS = int(os.environ.get("EPOCHS", "5000"))
+PATIENCE = int(os.environ.get("PATIENCE", "20"))
+_max_pat = os.environ.get("MAX_PATIENTS", "135")
+MAX_PATIENTS: Optional[int] = None if _max_pat.lower() in ("", "none", "all") else int(_max_pat)
+
+BASE_CHANNELS = int(os.environ.get("BASE_CHANNELS", "16"))
+SSM_DIM = int(os.environ.get("SSM_DIM", "16"))
 
 # Augmentation (applied per volume with probability AUG_PROB)
 AUG_PROB = 0.5
@@ -100,14 +84,13 @@ CLR_STEP_SIZE = 2290
 # Optimizer
 WEIGHT_DECAY = 1e-5
 
-# Classes: background + 5 hemorrhage types (edit names if your label map differs)
 CLASS_NAMES: Dict[int, str] = {
     0: "background",
-    1: "class_1",
-    2: "class_2",
-    3: "class_3",
-    4: "class_4",
-    5: "class_5",
+    1: "EDH",
+    2: "ICH",
+    3: "IVH",
+    4: "SAH",
+    5: "SDH",
 }
 
 # CT windows: [center, width]
@@ -118,9 +101,17 @@ CT_WINDOWS = [
     [60, 120],    # stroke/hemorrhage-ish
 ]
 
-# Class weights (optional): used for weighted losses (Dice + CE). Foreground upweighted by default.
-# Replace these with weights computed on your dataset if available.
-CLASS_WEIGHT_VALUES = [1.0] + [4.0] * (len(CLASS_NAMES) - 1)
+_STARTING_CLASS_WEIGHTS = [0.171, 198.741, 15.075, 52.645, 58.868, 28.757]
+
+
+def dampened_class_weights(starting: List[float]) -> List[float]:
+    min_w = min(starting)
+    normalized = [w / min_w for w in starting]
+    dampened = [math.sqrt(w) for w in normalized]
+    return [round(w, 3) for w in dampened]
+
+
+CLASS_WEIGHT_VALUES = dampened_class_weights(_STARTING_CLASS_WEIGHTS)
 
 
 # =============================================================================
@@ -145,7 +136,7 @@ def normalize_image01(image: np.ndarray) -> np.ndarray:
     mn = float(np.min(image))
     mx = float(np.max(image))
     if mx - mn <= 0:
-        return np.zeros_like(image, dtype=np.float32)
+        return image.astype(np.float32, copy=False)
     return ((image - mn) / (mx - mn)).astype(np.float32, copy=False)
 
 
@@ -166,7 +157,11 @@ def pad_depth_axis_background(img: np.ndarray, mask_oh: np.ndarray, pad_amount: 
     return np.concatenate([img, img_tail], axis=2), np.concatenate([mask_oh, mask_tail], axis=2)
 
 
-def zoom_2d(img: np.ndarray, mask: np.ndarray, zoom_factor: float) -> Tuple[np.ndarray, np.ndarray]:
+def zoom(img: np.ndarray, mask: np.ndarray, p: float = AUG_PROB) -> Tuple[np.ndarray, np.ndarray]:
+    if random.random() > p:
+        return img, mask
+
+    zoom_factor = random.uniform(0.7, 1.3)
     h, w = img.shape[0], img.shape[1]
     new_h = max(1, int(round(h * zoom_factor)))
     new_w = max(1, int(round(w * zoom_factor)))
@@ -181,51 +176,51 @@ def zoom_2d(img: np.ndarray, mask: np.ndarray, zoom_factor: float) -> Tuple[np.n
         axis=-1,
     )
 
-    def _fit_spatial(vol: np.ndarray) -> np.ndarray:
+    def _fit_spatial(vol: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
         out = np.asarray(vol)
         hh, ww = out.shape[0], out.shape[1]
-        if hh > h:
-            top = (hh - h) // 2
-            out = out[top : top + h, :, :, :]
-        if ww > w:
-            left = (ww - w) // 2
-            out = out[:, left : left + w, :, :]
+        if hh > target_h:
+            top = (hh - target_h) // 2
+            out = out[top : top + target_h, :, :, :]
+            hh = target_h
+        if ww > target_w:
+            left = (ww - target_w) // 2
+            out = out[:, left : left + target_w, :, :]
+            ww = target_w
         hh, ww = out.shape[0], out.shape[1]
-        if hh < h or ww < w:
-            pad_top = (h - hh) // 2
-            pad_bottom = h - hh - pad_top
-            pad_left = (w - ww) // 2
-            pad_right = w - ww - pad_left
+        if hh < target_h or ww < target_w:
+            pad_top = (target_h - hh) // 2
+            pad_bottom = target_h - hh - pad_top
+            pad_left = (target_w - ww) // 2
+            pad_right = target_w - ww - pad_left
             try:
                 out = np.pad(out, ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0), (0, 0)), mode="reflect")
             except ValueError:
                 out = np.pad(out, ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0), (0, 0)), mode="edge")
         return out
 
-    return _fit_spatial(img_scaled).astype(np.float32, copy=False), _fit_spatial(mask_scaled).astype(np.float32, copy=False)
+    return _fit_spatial(img_scaled, h, w), _fit_spatial(mask_scaled, h, w)
 
 
-def mirroring(img: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    # H flip
-    if random.random() < 0.5:
+def mirroring(img: np.ndarray, mask: np.ndarray, p: float = AUG_PROB) -> Tuple[np.ndarray, np.ndarray]:
+    if random.random() > p:
         img = np.flip(img, axis=0)
         mask = np.flip(mask, axis=0)
-    # W flip
-    if random.random() < 0.5:
+    if random.random() > p:
         img = np.flip(img, axis=1)
         mask = np.flip(mask, axis=1)
     return img, mask
 
 
-def random_rotate_90(img: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    k = random.choice([0, 1, 2, 3])
-    if k == 0:
+def random_rotate(img: np.ndarray, mask: np.ndarray, p: float = AUG_PROB) -> Tuple[np.ndarray, np.ndarray]:
+    if random.random() > p:
         return img, mask
+    k = random.choice([1, 2, 3])
     img_out = np.empty_like(img)
     mask_out = np.empty_like(mask)
-    for zz in range(img.shape[2]):
-        img_out[:, :, zz, :] = np.rot90(img[:, :, zz, :], k=k, axes=(0, 1))
-        mask_out[:, :, zz, :] = np.rot90(mask[:, :, zz, :], k=k, axes=(0, 1))
+    for d in range(img.shape[2]):
+        img_out[:, :, d, :] = np.rot90(img[:, :, d, :], k=k, axes=(0, 1))
+        mask_out[:, :, d, :] = np.rot90(mask[:, :, d, :], k=k, axes=(0, 1))
     return img_out, mask_out
 
 
@@ -276,15 +271,21 @@ class PatchGenerator:
         if self.shuffle:
             np.random.shuffle(self.indices)
 
-    def _load_and_preprocess(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
+    def _load_raw(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
         img = nib.load(self.image_files[idx], mmap=True).get_fdata(dtype=np.float32)
         img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
-        mask = nib.load(self.mask_files[idx], mmap=True).get_fdata().astype(np.int64, copy=False)
+        mask = nib.load(self.mask_files[idx], mmap=True).get_fdata().astype(np.uint8, copy=False)
+        return img, mask
 
+    def _preprocess(self, img: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         img = normalize_image01(standardize_windows(img, self.windows))
-        mask_oh = one_hot_np(mask, self.num_classes).astype(np.float32, copy=False)  # (H,W,D,C)
+        mask_oh = one_hot_np(mask, self.num_classes).astype(np.float32, copy=False)
 
-        # Resize to canonical size
+        if self.augment and random.random() > AUG_PROB:
+            img, mask_oh = zoom(img, mask_oh, p=AUG_PROB)
+            img, mask_oh = mirroring(img, mask_oh, p=AUG_PROB)
+            img, mask_oh = random_rotate(img, mask_oh, p=AUG_PROB)
+
         img = resize(
             img,
             (HEIGHT, WIDTH, img.shape[2], img.shape[3]),
@@ -299,14 +300,10 @@ class PatchGenerator:
             preserve_range=True,
             anti_aliasing=False,
         ).astype(np.float32, copy=False)
-
-        if self.augment and random.random() < AUG_PROB:
-            zf = random.uniform(0.7, 1.3)
-            img, mask_oh = zoom_2d(img, mask_oh, zf)
-            img, mask_oh = mirroring(img, mask_oh)
-            img, mask_oh = random_rotate_90(img, mask_oh)
-
         return img, mask_oh
+
+    def _load_and_preprocess(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        return self._preprocess(*self._load_raw(idx))
 
     def _patchify_all(self, img: np.ndarray, mask_oh: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int, int]]:
         ph, pw, pd, cin = self.patch_size
@@ -327,17 +324,28 @@ class PatchGenerator:
 
     def get_train_patches(self, patient_i: int) -> VolumeBatch:
         idx = int(self.indices[patient_i])
-        img, mask_oh = self._load_and_preprocess(idx)
+        img_raw, mask_raw = self._load_raw(idx)
+        empty = VolumeBatch(
+            patches_img=np.empty((0,) + self.patch_size, np.float32),
+            patches_mask=np.empty(
+                (0, self.patch_size[0], self.patch_size[1], self.patch_size[2], self.num_classes),
+                np.float32,
+            ),
+        )
 
-        # skip empty volumes (no foreground)
-        if float(mask_oh[..., 1:].sum()) <= 0.0:
-            return VolumeBatch(patches_img=np.empty((0,) + self.patch_size, np.float32), patches_mask=np.empty((0, self.patch_size[0], self.patch_size[1], self.patch_size[2], self.num_classes), np.float32))
+        for _ in range(100):
+            img, mask_oh = self._preprocess(img_raw, mask_raw)
+            if float(mask_oh[..., 1:].sum()) <= 0.0:
+                continue
 
-        patches_img, patches_mask, _grid = self._patchify_all(img, mask_oh)
+            patches_img, patches_mask, _grid = self._patchify_all(img, mask_oh)
+            fg_vox = patches_mask[..., 1:].sum(axis=(1, 2, 3, 4))
+            keep = (fg_vox / max(1.0, float(self.patch_voxels))) > self.threshold
+            if np.any(keep):
+                return VolumeBatch(patches_img=patches_img[keep], patches_mask=patches_mask[keep])
+            return empty
 
-        fg_vox = patches_mask[..., 1:].sum(axis=(1, 2, 3, 4))
-        keep = (fg_vox / max(1.0, float(self.patch_voxels))) > self.threshold
-        return VolumeBatch(patches_img=patches_img[keep], patches_mask=patches_mask[keep])
+        raise RuntimeError("Unable to generate a non-empty patch batch after multiple retries.")
 
     def get_volume_for_merge(self, patient_i: int) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[int, int, int]]]:
         idx = int(patient_i)
@@ -708,44 +716,87 @@ class InterpConv3d(nn.Module):
 
 
 class Mamba3DUNet(nn.Module):
-    def __init__(self, in_channels: int, num_classes: int, base_channels: int = 16, ssm_dim: int = 16, dropout: float = 0.1):
+    def __init__(
+        self,
+        in_channels: int,
+        num_classes: int,
+        base_channels: int = 16,
+        ssm_dim: int = 16,
+        dropout: float = 0.1,
+    ):
         super().__init__()
         TriBlock = TriOrientedMambaBlock_NoExt
 
-        self.enc1_conv = nn.Sequential(nn.Conv3d(in_channels, base_channels, 3, padding=1), nn.InstanceNorm3d(base_channels), nn.GELU())
+        self.enc1_conv = nn.Sequential(
+            nn.Conv3d(in_channels, base_channels, 3, padding=1),
+            nn.InstanceNorm3d(base_channels),
+            nn.GELU(),
+        )
         self.enc1_mamba_1 = TriBlock(base_channels, ssm_dim=ssm_dim, dropout_rate=dropout)
         self.pool1 = nn.MaxPool3d(2)
 
-        self.enc2_conv = nn.Sequential(nn.Conv3d(base_channels, base_channels * 2, 3, padding=1), nn.InstanceNorm3d(base_channels * 2), nn.GELU())
+        self.enc2_conv = nn.Sequential(
+            nn.Conv3d(base_channels, base_channels * 2, 3, padding=1),
+            nn.InstanceNorm3d(base_channels * 2),
+            nn.GELU(),
+        )
         self.enc2_mamba_1 = TriBlock(base_channels * 2, ssm_dim=ssm_dim, dropout_rate=dropout)
         self.enc2_mamba_2 = TriBlock(base_channels * 2, ssm_dim=ssm_dim, dropout_rate=dropout)
         self.pool2 = nn.MaxPool3d(2)
 
-        self.enc3_conv = nn.Sequential(nn.Conv3d(base_channels * 2, base_channels * 4, 3, padding=1), nn.InstanceNorm3d(base_channels * 4), nn.GELU())
+        self.enc3_conv = nn.Sequential(
+            nn.Conv3d(base_channels * 2, base_channels * 4, 3, padding=1),
+            nn.InstanceNorm3d(base_channels * 4),
+            nn.GELU(),
+        )
         self.enc3_mamba_1 = TriBlock(base_channels * 4, ssm_dim=ssm_dim, dropout_rate=dropout)
         self.enc3_mamba_2 = TriBlock(base_channels * 4, ssm_dim=ssm_dim, dropout_rate=dropout)
         self.pool3 = nn.MaxPool3d(2)
 
-        self.enc4_conv = nn.Sequential(nn.Conv3d(base_channels * 4, base_channels * 8, 3, padding=1), nn.InstanceNorm3d(base_channels * 8), nn.GELU())
+        self.enc4_conv = nn.Sequential(
+            nn.Conv3d(base_channels * 4, base_channels * 8, 3, padding=1),
+            nn.InstanceNorm3d(base_channels * 8),
+            nn.GELU(),
+        )
         self.pool4 = nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2))
 
-        self.bottleneck_conv = nn.Sequential(nn.Conv3d(base_channels * 8, base_channels * 16, 3, padding=1), nn.InstanceNorm3d(base_channels * 16), nn.GELU())
+        self.bottleneck_conv = nn.Sequential(
+            nn.Conv3d(base_channels * 8, base_channels * 16, 3, padding=1),
+            nn.InstanceNorm3d(base_channels * 16),
+            nn.GELU(),
+        )
 
         self.up4 = InterpConv3d(base_channels * 16, base_channels * 8, scale_factor=(1, 2, 2))
-        self.dec4_conv = nn.Sequential(nn.Conv3d(base_channels * 16, base_channels * 8, 3, padding=1), nn.InstanceNorm3d(base_channels * 8), nn.GELU())
+        self.dec4_conv = nn.Sequential(
+            nn.Conv3d(base_channels * 16, base_channels * 8, 3, padding=1),
+            nn.InstanceNorm3d(base_channels * 8),
+            nn.GELU(),
+        )
 
         self.up3 = InterpConv3d(base_channels * 8, base_channels * 4, scale_factor=(2, 2, 2))
-        self.dec3_conv = nn.Sequential(nn.Conv3d(base_channels * 8, base_channels * 4, 3, padding=1), nn.InstanceNorm3d(base_channels * 4), nn.GELU())
+        self.dec3_conv = nn.Sequential(
+            nn.Conv3d(base_channels * 8, base_channels * 4, 3, padding=1),
+            nn.InstanceNorm3d(base_channels * 4),
+            nn.GELU(),
+        )
         self.dec3_mamba_1 = TriBlock(base_channels * 4, ssm_dim=ssm_dim, dropout_rate=dropout)
         self.dec3_mamba_2 = TriBlock(base_channels * 4, ssm_dim=ssm_dim, dropout_rate=dropout)
 
         self.up2 = InterpConv3d(base_channels * 4, base_channels * 2, scale_factor=(2, 2, 2))
-        self.dec2_conv = nn.Sequential(nn.Conv3d(base_channels * 4, base_channels * 2, 3, padding=1), nn.InstanceNorm3d(base_channels * 2), nn.GELU())
+        self.dec2_conv = nn.Sequential(
+            nn.Conv3d(base_channels * 4, base_channels * 2, 3, padding=1),
+            nn.InstanceNorm3d(base_channels * 2),
+            nn.GELU(),
+        )
         self.dec2_mamba_1 = TriBlock(base_channels * 2, ssm_dim=ssm_dim, dropout_rate=dropout)
         self.dec2_mamba_2 = TriBlock(base_channels * 2, ssm_dim=ssm_dim, dropout_rate=dropout)
 
         self.up1 = InterpConv3d(base_channels * 2, base_channels, scale_factor=(2, 2, 2))
-        self.dec1_conv = nn.Sequential(nn.Conv3d(base_channels * 2, base_channels, 3, padding=1), nn.InstanceNorm3d(base_channels), nn.GELU())
+        self.dec1_conv = nn.Sequential(
+            nn.Conv3d(base_channels * 2, base_channels, 3, padding=1),
+            nn.InstanceNorm3d(base_channels),
+            nn.GELU(),
+        )
         self.dec1_mamba_1 = TriBlock(base_channels, ssm_dim=ssm_dim, dropout_rate=dropout)
 
         self.out_conv = nn.Conv3d(base_channels, num_classes, kernel_size=1)
@@ -756,13 +807,11 @@ class Mamba3DUNet(nn.Module):
         p1 = self.pool1(e1)
 
         e2 = self.enc2_conv(p1)
-        e2 = e2 + self.enc2_mamba_1(e2)
-        e2 = e2 + self.enc2_mamba_2(e2)
+        e2 = e2 + self.enc2_mamba_1(e2) + self.enc2_mamba_2(e2)
         p2 = self.pool2(e2)
 
         e3 = self.enc3_conv(p2)
-        e3 = e3 + self.enc3_mamba_1(e3)
-        e3 = e3 + self.enc3_mamba_2(e3)
+        e3 = e3 + self.enc3_mamba_1(e3) + self.enc3_mamba_2(e3)
         p3 = self.pool3(e3)
 
         e4 = self.enc4_conv(p3)
@@ -773,30 +822,24 @@ class Mamba3DUNet(nn.Module):
         d4 = self.up4(b)
         if d4.shape[2:] != e4.shape[2:]:
             d4 = F.interpolate(d4, size=e4.shape[2:], mode="trilinear", align_corners=False)
-        d4 = torch.cat([d4, e4], dim=1)
-        d4 = self.dec4_conv(d4)
+        d4 = self.dec4_conv(torch.cat([d4, e4], dim=1))
 
         d3 = self.up3(d4)
         if d3.shape[2:] != e3.shape[2:]:
             d3 = F.interpolate(d3, size=e3.shape[2:], mode="trilinear", align_corners=False)
-        d3 = torch.cat([d3, e3], dim=1)
-        d3 = self.dec3_conv(d3)
-        d3 = d3 + self.dec3_mamba_1(d3)
-        d3 = d3 + self.dec3_mamba_2(d3)
+        d3 = self.dec3_conv(torch.cat([d3, e3], dim=1))
+        d3 = d3 + self.dec3_mamba_1(d3) + self.dec3_mamba_2(d3)
 
         d2 = self.up2(d3)
         if d2.shape[2:] != e2.shape[2:]:
             d2 = F.interpolate(d2, size=e2.shape[2:], mode="trilinear", align_corners=False)
-        d2 = torch.cat([d2, e2], dim=1)
-        d2 = self.dec2_conv(d2)
-        d2 = d2 + self.dec2_mamba_1(d2)
-        d2 = d2 + self.dec2_mamba_2(d2)
+        d2 = self.dec2_conv(torch.cat([d2, e2], dim=1))
+        d2 = d2 + self.dec2_mamba_1(d2) + self.dec2_mamba_2(d2)
 
         d1 = self.up1(d2)
         if d1.shape[2:] != e1.shape[2:]:
             d1 = F.interpolate(d1, size=e1.shape[2:], mode="trilinear", align_corners=False)
-        d1 = torch.cat([d1, e1], dim=1)
-        d1 = self.dec1_conv(d1)
+        d1 = self.dec1_conv(torch.cat([d1, e1], dim=1))
         d1 = d1 + self.dec1_mamba_1(d1)
         return self.out_conv(d1)
 
@@ -957,12 +1000,19 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
 
-    _base = 16
-    _ssm = 16
-    model = Mamba3DUNet(in_channels=cin, num_classes=num_classes, base_channels=_base, ssm_dim=_ssm, dropout=0.1).to(device)
-    print(f"Model: Mamba3DUNet(cin={cin}, classes={num_classes}, base={_base}, ssm_dim={_ssm})")
-
+    model = Mamba3DUNet(
+        in_channels=cin,
+        num_classes=num_classes,
+        base_channels=BASE_CHANNELS,
+        ssm_dim=SSM_DIM,
+        dropout=0.1,
+    ).to(device)
+    print(
+        f"Model: Mamba3DUNet(cin={cin}, classes={num_classes}, "
+        f"base={BASE_CHANNELS}, ssm_dim={SSM_DIM})"
+    )
     class_weights = torch.tensor(CLASS_WEIGHT_VALUES, dtype=torch.float32, device=device)
+    print(f"Dampened weights: {CLASS_WEIGHT_VALUES}")
 
     optimizer = optim.AdamW(model.parameters(), lr=INITIAL_LR, weight_decay=WEIGHT_DECAY)
     scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
@@ -1052,7 +1102,6 @@ def main() -> None:
 
         avg_train_loss = train_loss_sum / max(1, train_steps)
 
-        # Validation: merged volume with VAL_STEP tiling (Gaussian stitch)
         val_metrics = run_merged_eval(
             model=model,
             device=device,
@@ -1126,7 +1175,6 @@ def main() -> None:
 
         train_gen.on_epoch_end()
 
-    # Final test evaluation (merged, no TTA)
     test_metrics = run_merged_eval(
         model=model,
         device=device,
